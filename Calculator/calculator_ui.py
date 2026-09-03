@@ -5,7 +5,7 @@ SW개발비 기능점수(FP) 산정양식 편집기 - 화면·실행 담당
 
 역할 분리
   calculator_ui.py       화면(HTML), 웹서버, 엑셀 읽기·쓰기 엔진, 개발비 계산 모델
-  calculator_detail.py   정통법·상세법 양식 사양  (2024-정통법 / 2016-상세법)
+  calculator_detail.py   정통법·상세법 양식 사양  (2024-정통법 / 2016-기능점수)
   calculator_simple.py   간이법 양식 사양          (2024-간이법)
 
 양식을 새로 추가할 때는 사양 파일에 항목 하나를 더 쓰면 되고 화면은 건드리지 않는다.
@@ -33,6 +33,26 @@ from flask import Flask, request, jsonify, Response
 
 import openpyxl
 
+# ── 폴더 구조 대응 ────────────────────────────────────────────
+# FP-Checker/Calculator, FP-Checker/Comparator 처럼 나뉘어 있어도 서로 불러온다.
+# 프로젝트 루트 자체는 넣지 않는다. 루트에 예전 사본이 남아 있으면
+# 같은 이름이 먼저 읽혀 옛 코드가 도는 일이 생기기 때문이다.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PKGS = ("Calculator", "Comparator", "DocParser")
+for _p in [os.path.join(os.path.dirname(_HERE), _n) for _n in _PKGS] + [_HERE]:
+    if os.path.isdir(_p):
+        if _p in sys.path:
+            sys.path.remove(_p)
+        sys.path.insert(0, _p)
+
+
+def project_root():
+    """설정 파일을 둘 위치. 하위 폴더로 나뉘어 있으면 그 위(프로젝트 루트)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(_HERE) if os.path.basename(_HERE) in _PKGS else _HERE
+
+
 APP_NAME = "SW개발비 FP 산정양식 편집기"
 VERSION = "3.0"
 
@@ -46,6 +66,46 @@ DEV_TYPES = ["신규 개발", "수정 후 재사용", "수정 없이 재사용"]
 #             text 자유입력 / num 숫자 / sel 선택 / ro 계산결과(읽기전용)
 # fp.anchor : 머리글 행을 찾는 표식. 앞쪽 작성가이드 본문에 같은 낱말이 나와도
 #             애플리케이션명 열과 FP유형 열이 같은 행에 있어야 머리글로 본다.
+
+# 다른 모듈(comparator 등)이 이 값을 빌려 쓰므로, 양식 사양을 불러오기 **전에** 만들어 둔다.
+# 아래 import 도중에 다른 모듈이 이 모듈을 되부를 수 있어, 그때 이미 있어야 한다.
+HEADER_MAP = [
+    ("wtadj",  ["가중치변경률", "변경률적용가중치"]),
+    ("app",    ["애플리케이션명", "어플리케이션명"]),
+    ("biz",    ["세부업무명"]),
+    ("proc",   ["단위프로세스명", "단위업무명", "단위기능명"]),
+    ("desc",   ["단위프로세스설명", "기능설명", "설명"]),
+    ("dev",    ["개발유형"]),
+    ("chg",    ["설계변경률", "설계변경율"]),
+    ("type",   ["FP유형", "기능유형"]),
+    ("ftr",    ["RET", "FTR"]),
+    ("det",    ["DET"]),
+    ("cx",     ["복잡도"]),
+    ("wt",     ["가중치"]),
+    ("remark", ["비고"]),
+]
+METHODS = ("간이법", "상세법")
+
+
+def map_header(rowvals):
+    """머리글 한 줄을 보고 어떤 열이 무엇인지 맞춘다.
+    열이 밀려 있거나 일부 열이 없어도 된다. 맞으면 {키: 열번호}, 아니면 None."""
+    found = {}
+    for i, v in enumerate(rowvals, start=1):
+        t = _flat(v)
+        if not t:
+            continue
+        for key, pats in HEADER_MAP:
+            if key in found:
+                continue
+            if any(p in t for p in pats):
+                found[key] = i
+                break
+    if "app" in found and "type" in found and "proc" in found:
+        return found
+    return None
+
+
 
 # 양식 사양은 별도 파일에서 불러온다.
 import calculator_detail as SPEC_DETAIL
@@ -90,6 +150,8 @@ def form_list(keys):
 
 # 화면에 보여줄 양식 목록(제한 가능). main(only=...) 으로 좁힌다.
 VISIBLE = list(FORMS)
+
+assert "HEADER_MAP" in globals(), "HEADER_MAP 은 양식 사양 import 보다 먼저 있어야 합니다"
 
 
 # 2024 양식 개발비 시트 입력 셀
@@ -139,7 +201,7 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-INI_PATH = os.path.join(app_dir(), "calculator_ui.ini")
+INI_PATH = os.path.join(project_root(), "calculator_ui.ini")
 
 
 def load_ini():
@@ -325,6 +387,27 @@ STATE = {"path": None, "wb": None, "form": None, "fp": None, "cost": None,
          "rows": [], "params": {}, "last_row": 0, "payload": None}
 
 
+EXCEL_EXT = (".xlsx", ".xlsm", ".xltx", ".xltm")
+
+
+def check_path(path):
+    """열 수 있는 파일인지 먼저 본다. 문제가 있으면 사람이 읽을 수 있는 사유를 돌려준다."""
+    if not path:
+        return "파일 경로가 비어 있습니다."
+    if os.path.isdir(path):
+        return ("폴더입니다. 폴더 안의 파일을 고르십시오.\n%s" % path)
+    if not os.path.exists(path):
+        return "파일을 찾을 수 없습니다.\n%s" % path
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in EXCEL_EXT:
+        if ext == ".xls":
+            return ("예전 형식(.xls)은 열 수 없습니다. 엑셀에서 "
+                    "'다른 이름으로 저장 → Excel 통합 문서(.xlsx)' 로 바꾼 뒤 여십시오.")
+        return ("%s 형식은 열 수 없습니다. .xlsx 또는 .xlsm 파일을 고르십시오."
+                % (ext if ext else "확장자가 없는 파일"))
+    return None
+
+
 def guess_form(path):
     """시트 구성만 보고 어느 양식인지 추정한다(화면 기본 선택값)."""
     try:
@@ -336,9 +419,100 @@ def guess_form(path):
     if any("FP산정(간이법)" in n for n in names):
         return "2024-간이법"
     if any("FP집계" in n for n in names) or any("개발비산출" in n for n in names):
-        return "2016-상세법"
+        return "2016-기능점수"
     if any("SW개발비산정" in n for n in names):
         return "2024-정통법"
+    return None
+
+
+def probe(path, form_key):
+    """파일을 실제로 열어 그 양식으로 읽히는지 확인한다(선택 화면 표시용).
+    맞으면 시트·머리글 행·산정방법·기능 수를 돌려주고, 아니면 None."""
+    spec = FORMS[form_key]["fp"]
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    except Exception:
+        return None
+    try:
+        names = wb.sheetnames
+        ws = None
+        for n in spec["sheets"]:
+            if n in names:
+                ws = wb[n]
+                break
+        if ws is None:
+            return None
+
+        hrow, mapped = None, None
+        method = spec.get("method", "상세법")
+        method_src = "양식 기본값"
+        want_method = bool(spec.get("method_dv"))
+        count = 0
+        blank = 0
+        has_ftr = has_det = False
+        for r, vals in enumerate(ws.iter_rows(min_col=1, max_col=30, values_only=True), start=1):
+            if hrow is None:
+                if want_method and method_src == "양식 기본값":
+                    for x in vals:
+                        if _s(x) in METHODS:
+                            method = _s(x)
+                            method_src = "파일의 산정방법 칸"
+                            break
+                got = map_header(vals)
+                if got:
+                    hrow, mapped = r, got
+                continue
+            keys = [k for k in ("app", "biz", "proc", "desc", "type") if k in mapped]
+            if not any(_s(vals[mapped[k] - 1]) for k in keys if len(vals) >= mapped[k]):
+                blank += 1
+                if blank > 2000 and count:
+                    break
+                continue
+            blank = 0
+            count += 1
+            if "ftr" in mapped and len(vals) >= mapped["ftr"] and _s(vals[mapped["ftr"] - 1]):
+                has_ftr = True
+            if "det" in mapped and len(vals) >= mapped["det"] and _s(vals[mapped["det"] - 1]):
+                has_det = True
+        if hrow is None:
+            return None
+        if want_method and method_src == "양식 기본값":
+            method = "상세법" if (has_ftr and has_det) else "간이법"
+            method_src = "RET/FTR·DET 유무로 추정"
+
+        cspec = FORMS[form_key]["cost"]
+        want = [n.replace(" ", "") for n in cspec.get("sheets", [])]
+        like = cspec.get("sheet_like", [])
+        cost = "없음"
+        for x in names:                       # 실제 시트 이름을 그대로 알려 준다
+            flat_x = x.replace(" ", "")
+            if flat_x in want or any(k in flat_x for k in like):
+                cost = x
+                break
+        return {"form": form_key, "formName": FORMS[form_key].get("name", form_key),
+                "code": FORMS[form_key].get("code", ""), "sheet": ws.title,
+                "headerRow": hrow, "method": method, "methodSrc": method_src,
+                "count": count, "cost": cost,
+                "cols": [k for k, _ in HEADER_MAP if k in (mapped or {})]}
+    except Exception:
+        return None
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def detect_form(path):
+    """파일 안을 보고 양식을 고른다. 시트 이름으로 짐작한 것을 먼저 확인한다."""
+    ready = [k for k in FORMS if is_ready(k)]
+    first = guess_form(path)
+    order = ([first] if first in ready else []) + [k for k in ready if k != first]
+    for k in order:
+        got = probe(path, k)
+        if got:
+            got["guessed"] = (k == first)
+            return got
     return None
 
 
@@ -351,6 +525,27 @@ def pick_sheet(wb, spec):
             if key in n.replace(" ", ""):
                 return wb[n]
     return None
+
+
+def find_header_by_text(ws, limit=400):
+    """표 머리글 행과 열 배치를 글자로 찾는다."""
+    wide = min(ws.max_column or 30, 40)
+    for r in range(1, min(ws.max_row, limit) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, wide + 1)]
+        got = map_header(vals)
+        if got:
+            return r, got
+    return None, None
+
+
+def find_method_by_value(ws, upto):
+    """머리글 앞쪽에서 값이 '간이법'/'상세법' 인 칸을 찾는다(자리보다 값이 믿을 만하다)."""
+    wide = min(ws.max_column or 20, 20)
+    for r in range(1, upto):
+        for c in range(1, wide + 1):
+            if _s(ws.cell(r, c).value) in METHODS:
+                return _s(ws.cell(r, c).value)
+    return ""
 
 
 def find_header_row(ws, anchor):
@@ -429,21 +624,43 @@ def read_workbook(path, form_key):
         raise ValueError("%s 에 필요한 FP 시트(%s)가 없습니다. "
                          "양식 선택이 맞는지 확인하십시오."
                          % (form["name"], " / ".join(form["fp"]["sheets"])))
-    hrow = find_header_row(ws, form["fp"]["anchor"])
+    hrow, mapped = find_header_by_text(ws)
+    if hrow is None:
+        hrow = find_header_row(ws, form["fp"]["anchor"])
+        mapped = None
     if hrow is None:
         raise ValueError("'%s' 시트에서 표 머리글(애플리케이션명·FP유형)을 찾지 못했습니다. "
                          "양식 선택이 맞는지 확인하십시오." % ws.title)
     start = hrow + 1
-    cols = form["fp"]["cols"]
+    # 열 위치는 파일에서 찾은 것을 쓰고, 없는 열은 화면에서도 뺀다
+    cols = []
+    for c in form["fp"]["cols"]:
+        c = dict(c)
+        if mapped:
+            if c["k"] not in mapped:
+                continue
+            c["x"] = mapped[c["k"]]
+        cols.append(c)
     cx = {c["k"]: c["x"] for c in cols}
-    last_allowed = dv_last_row(ws, cx["type"]) or ws.max_row
+    # 유효성검사 범위가 실제 데이터보다 짧을 수 있으므로 시트 끝까지를 상한으로 본다
+    last_allowed = max(dv_last_row(ws, cx["type"]), ws.max_row)
 
     method = form["fp"].get("method", "상세법")
     method_cell = None
+    method_src = "양식 기본값"
     if form["fp"].get("method_dv"):
-        method_cell = find_method_cell(ws, form["fp"]["method_dv"])
-        if method_cell:
-            method = _s(ws[method_cell].value) or method
+        hint = form["fp"].get("method_cell")
+        for cand in (hint, find_method_cell(ws, form["fp"]["method_dv"])):
+            if cand and _s(ws[cand].value) in METHODS:
+                method_cell = cand
+                method = _s(ws[cand].value)
+                method_src = "파일의 산정방법 칸"
+                break
+        if method_src == "양식 기본값":
+            v = find_method_by_value(ws, hrow)
+            if v:
+                method = v
+                method_src = "파일에서 찾은 값"
 
     ro_keys = [c["k"] for c in cols if c["t"] == "ro"]
     cached = {}
@@ -466,17 +683,27 @@ def read_workbook(path, form_key):
     input_keys = [c["k"] for c in cols if c["t"] != "ro"]
     rows = []
     last_row = start - 1
+    blank = 0
     for r in range(start, min(ws.max_row, last_allowed) + 1):
         rec = {k: _s(ws.cell(r, cx[k]).value) for k in input_keys}
         if not any(rec[k] for k in input_keys):
+            blank += 1
+            if blank > 2000 and rows:      # 서식만 남아 시트 끝이 부풀려진 파일 대비
+                break
             continue
+        blank = 0
         last_row = r
         rec["type"] = rec.get("type", "").upper()
         for k in ro_keys:
             rec["file_" + k] = _s((cached.get(r) or {}).get(k))
         rows.append(rec)
 
-    params = {"method": method, "methodCell": method_cell}
+    if form["fp"].get("method_dv") and method_src == "양식 기본값":
+        has = any(r.get("ftr") for r in rows) and any(r.get("det") for r in rows)
+        method = "상세법" if has else "간이법"
+        method_src = "RET/FTR·DET 유무로 추정"
+
+    params = {"method": method, "methodCell": method_cell, "methodSrc": method_src}
 
     cost_spec = form["cost"]
     cs = pick_sheet(wb, cost_spec)
@@ -496,7 +723,8 @@ def read_workbook(path, form_key):
         "path": path, "name": os.path.basename(path), "form": form_key,
         "formName": form["name"], "sheet": ws.title, "headerRow": hrow,
         "startRow": start, "maxRows": max(0, last_allowed - start + 1),
-        "cols": cols, "fpTypes": FP_TYPES, "devTypes": DEV_TYPES,
+        "cols": cols, "mapped": bool(mapped),
+        "fpTypes": FP_TYPES, "devTypes": DEV_TYPES,
         "simpleWeight": SIMPLE_WEIGHT, "rows": rows, "params": params,
         "cost": cost, "adjTable": ADJ_TABLE, "adjLabel": ADJ_LABEL,
     }
@@ -587,9 +815,12 @@ def write_workbook(rows, params, out_path):
     ws = wb[fp["sheet"]]
     cx, cols, start = fp["cx"], fp["cols"], fp["start"]
     n = len(rows)
-    if start + n - 1 > fp["last_allowed"]:
-        raise ValueError("양식이 허용하는 행 수(%d행)를 넘었습니다."
-                         % (fp["last_allowed"] - start + 1))
+    # 데이터 유효성 검사 범위는 파일마다 들쭉날쭉하므로, 그보다 아래로도 쓸 수 있게 여유를 둔다.
+    # 여유분에 쓴 행에는 드롭다운이 없지만 값과 수식은 정상이다.
+    limit = fp["last_allowed"] + 5000
+    if start + n - 1 > limit:
+        raise ValueError("한 시트에 넣을 수 있는 행 수(%d행)를 넘었습니다."
+                         % (limit - start + 1))
 
     input_keys = [c["k"] for c in cols if c["t"] != "ro"]
     num_keys = {c["k"] for c in cols if c["t"] == "num"}
@@ -704,26 +935,36 @@ def api_init():
     cp = load_ini()
     recent = [p for p in cp["main"].get("recent", "").split("|") if p and os.path.exists(p)]
     forms = form_list(VISIBLE)
+    m = cp["main"]
     return jsonify({"app": APP_NAME, "version": VERSION, "recent": recent,
-                    "forms": forms, "data": STATE.get("payload")})
+                    "forms": forms, "data": STATE.get("payload"),
+                    "lastDir": m.get("last_dir", ""),
+                    "lastPath": m.get("last_path", "")})
 
 
 @app.route("/api/guess", methods=["POST"])
 def api_guess():
     path = (request.json or {}).get("path", "").strip().strip('"')
-    if not path or not os.path.exists(path):
-        return jsonify({"ok": False, "msg": "파일을 찾을 수 없습니다."})
-    return jsonify({"ok": True, "form": guess_form(path)})
+    if path and os.path.isdir(path):
+        return jsonify({"ok": True, "isDir": True, "dir": path, "form": None,
+                        "info": None, "msg": "폴더입니다. 안에 있는 파일을 고르십시오."})
+    bad = check_path(path)
+    if bad:
+        return jsonify({"ok": False, "msg": bad})
+    info = detect_form(path)
+    if not info:
+        return jsonify({"ok": True, "form": guess_form(path), "info": None,
+                        "msg": "파일 안에서 FP 표를 찾지 못했습니다. 양식을 직접 고르십시오."})
+    return jsonify({"ok": True, "form": info["form"], "info": info})
 
 
 @app.route("/api/open", methods=["POST"])
 def api_open():
     body = request.json or {}
     path = body.get("path", "").strip().strip('"')
-    if not path:
-        return jsonify({"ok": False, "msg": "파일 경로가 비어 있습니다."})
-    if not os.path.exists(path):
-        return jsonify({"ok": False, "msg": "파일을 찾을 수 없습니다: %s" % path})
+    bad = check_path(path)
+    if bad:
+        return jsonify({"ok": False, "msg": bad})
     form = body.get("form") or guess_form(path)
     if form and not is_ready(form):
         return jsonify({"ok": False,
@@ -741,6 +982,8 @@ def api_open():
     recent.insert(0, path)
     cp["main"]["recent"] = "|".join(recent[:8])
     cp["main"]["last_form"] = form
+    cp["main"]["last_path"] = path
+    cp["main"]["last_dir"] = os.path.dirname(os.path.abspath(path))
     save_ini(cp)
     return jsonify({"ok": True, "data": data})
 
@@ -766,14 +1009,21 @@ def api_browse():
                         "msg": "파일 선택 창을 열 수 없습니다(%s). 경로를 직접 입력하십시오." % e})
 
 
+def remember(key, value):
+    cp = load_ini()
+    cp["main"][key] = value
+    save_ini(cp)
+
+
 @app.route("/api/list", methods=["POST"])
 def api_list():
     """폴더 안의 엑셀 파일과 하위 폴더를 돌려준다."""
     d = (request.json or {}).get("dir", "").strip().strip('"')
     if not d:
-        cp = load_ini()
-        recent = [p for p in cp["main"].get("recent", "").split("|") if p]
-        d = os.path.dirname(recent[0]) if recent else os.getcwd()
+        m = load_ini()["main"]
+        cand = [m.get("last_dir", "")]
+        cand += [os.path.dirname(p) for p in m.get("recent", "").split("|") if p]
+        d = next((x for x in cand if x and os.path.isdir(x)), os.getcwd())
     if not os.path.isdir(d):
         return jsonify({"ok": False, "msg": "폴더가 아닙니다: %s" % d})
     dirs, files = [], []
@@ -789,6 +1039,9 @@ def api_list():
     except Exception as e:
         return jsonify({"ok": False, "msg": "폴더를 읽을 수 없습니다: %s" % e})
     parent = os.path.dirname(os.path.abspath(d))
+    cp = load_ini()
+    cp["main"]["last_dir"] = os.path.abspath(d)      # 다음에도 이 폴더에서 시작
+    save_ini(cp)
     return jsonify({"ok": True, "dir": os.path.abspath(d),
                     "parent": parent if parent != d else "",
                     "dirs": dirs[:300], "files": files[:300],
@@ -897,6 +1150,10 @@ tr.bad td.ro{background:#fdecea;color:#c0392b;font-weight:700}
 #open .soon{font-size:11px;color:#b06000;background:#fff3e0;border:1px solid #ffcc80;
   border-radius:3px;padding:1px 5px;margin-left:4px}
 #open .fn{font-size:11px;color:#999;margin:2px 0 0 52px}
+#probe{margin:6px 0 0;padding:8px 10px;border:1px solid #cfd8dc;background:#f5f9fc;
+  border-radius:3px;font-size:12px;line-height:1.7}
+#probe b{color:#12507b}
+#probe .no{color:#b06000}
 #open h3{font-size:13px;margin:18px 0 6px;padding-left:6px;border-left:4px solid #2c3e50}
 .rec{display:block;margin:3px 0;color:#12507b;text-decoration:none;font-size:12px}
 small{color:#666}
@@ -924,8 +1181,8 @@ small{color:#666}
   </div>
   <h3>2. 양식 선택</h3>
   <div id="forms"></div>
-  <p><button onclick="doOpen()" style="padding:8px 22px;font-size:13px">열기</button>
-     <span id="guessMsg"></span></p>
+  <p><button onclick="doOpen()" style="padding:8px 22px;font-size:13px">열기</button></p>
+  <div id="guessMsg"></div>
   <div id="recent"></div>
 </div>
 
@@ -1395,18 +1652,69 @@ function paintForms(sel){
   });
   document.getElementById('forms').innerHTML=h;
 }
+function showPicker(on){document.getElementById('browser').style.display=on?'block':'none';}
+function listDir(d){
+  showPicker(true);
+  fetch('/api/list',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({dir:d||document.getElementById('dir').value})})
+   .then(function(r){return r.json();}).then(function(j){
+    var box=document.getElementById('entries');
+    if(!j.ok){box.innerHTML='<span class="warn">'+esc(j.msg)+'</span>';return;}
+    document.getElementById('dir').value=j.dir;
+    var h='';
+    if(j.parent&&j.parent!==j.dir)
+      h+='<a class="rec" href="#" onclick="listDir('+JSON.stringify(j.parent)+');return false;">.. 상위 폴더</a>';
+    j.dirs.forEach(function(n){
+      h+='<a class="rec" href="#" onclick="listDir('+JSON.stringify(j.dir+j.sep+n)+');return false;">[폴더] '+esc(n)+'</a>';});
+    j.files.forEach(function(n){
+      h+='<a class="rec" href="#" onclick="pickPath('+JSON.stringify(j.dir+j.sep+n)+');return false;">'+esc(n)+'</a>';});
+    if(!j.dirs.length&&!j.files.length) h='<small>이 폴더에 엑셀 파일이 없습니다.</small>';
+    box.innerHTML=h;});
+}
+function pickPath(p){
+  document.getElementById('path').value=p;
+  showPicker(false);
+  guess();
+}
 function browse(){fetch('/api/browse',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({mode:'open'})}).then(function(r){return r.json();}).then(function(j){
     if(j.ok&&j.path){pickPath(j.path);}
-    else if(!j.ok){toast(j.msg);listDir('');}});}
+    else {toast(j.msg||'파일 선택 창을 열 수 없습니다.');listDir('');}});}
 function guess(){
   var p=document.getElementById('path').value;
   if(!p)return;
   fetch('/api/guess',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({path:p})}).then(function(r){return r.json();}).then(function(j){
-    if(j.ok&&j.form){paintForms(j.form);
-      document.getElementById('guessMsg').innerHTML='<small>시트 구성으로 보아 '+j.form+' 양식으로 판단했습니다. 다르면 위에서 바꾸십시오.</small>';}
-    else document.getElementById('guessMsg').innerHTML='<small>양식을 판단하지 못했습니다. 직접 선택하십시오.</small>';
+    var el=document.getElementById('guessMsg');
+    if(j.isDir){
+      el.innerHTML='<div id="probe" class="no">폴더입니다. 아래 목록에서 파일을 고르십시오.</div>';
+      document.getElementById('path').value='';
+      document.getElementById('dir').value=j.dir;
+      listDir(j.dir);
+      return;
+    }
+    if(j.ok===false){
+      el.innerHTML='<div id="probe" class="no">'+esc(j.msg||'').replace(/\n/g,'<br>')+'</div>';
+      return;
+    }
+    if(j.info){
+      var i=j.info;
+      paintForms(i.form);
+      el.innerHTML='<div id="probe">파일을 열어 확인했습니다.<br>'+
+        '양식 <b>'+esc(i.code+' '+i.formName)+'</b><br>'+
+        '산정방법 <b>'+esc(i.method)+'</b> <span style="color:#999">('+esc(i.methodSrc)+')</span>'+
+        ' · 기능 <b>'+i.count.toLocaleString()+'</b>건'+
+        ' · 시트 '+esc(i.sheet)+' 머리글 '+i.headerRow+'행<br>'+
+        '개발비 시트 '+(i.cost==='없음'
+          ? '<span class="no">없음 — FP 산정과 검증만 쓸 수 있습니다</span>'
+          : esc(i.cost))+
+        '</div>';
+    }else if(j.ok&&j.form){
+      paintForms(j.form);
+      el.innerHTML='<div id="probe">시트 이름으로 보아 '+esc(j.form)+' 양식으로 보입니다. 다르면 위에서 바꾸십시오.</div>';
+    }else{
+      el.innerHTML='<div id="probe" class="no">'+esc(j.msg||'양식을 판단하지 못했습니다. 직접 고르십시오.')+'</div>';
+    }
   });}
 function doOpen(){
   var p=document.getElementById('path').value;
@@ -1455,8 +1763,17 @@ function quit(){
 window.onbeforeunload=function(){if(DIRTY)return '저장하지 않은 변경이 있습니다.';};
 setInterval(function(){fetch('/api/alive',{method:'POST'});},4000);
 document.getElementById('path').addEventListener('change',guess);
+document.getElementById('path').addEventListener('keydown',function(e){
+  if(e.key==='Enter'){e.preventDefault();guess();}});
+document.getElementById('dir').addEventListener('keydown',function(e){
+  if(e.key==='Enter'){e.preventDefault();listDir(this.value);}});
 fetch('/api/init').then(function(r){return r.json();}).then(function(j){
   FORMS=j.forms; paintForms(j.data?j.data.form:'');
+  if(j.lastDir) document.getElementById('dir').value=j.lastDir;
+  if(!j.data && j.lastPath){            // 지난번에 연 파일을 그대로 채워 둔다
+    document.getElementById('path').value=j.lastPath;
+    guess();
+  }
   if(j.data) load(j.data);
   var h='';
   if(j.recent&&j.recent.length){h='<h3>최근 파일</h3>';
@@ -1497,11 +1814,11 @@ def arg_form():
     return None
 
 
-def open_browser(url):
+def open_browser(url, profile=".chrome_calc_ui"):
     chrome = find_chrome()
     proc = None
     if chrome:
-        profile = os.path.join(tempfile.gettempdir(), ".chrome_calc_ui")
+        profile = os.path.join(tempfile.gettempdir(), profile)
         try:
             proc = subprocess.Popen(
                 [chrome, "--app=" + url, "--window-size=1500,950",

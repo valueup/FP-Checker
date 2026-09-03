@@ -39,7 +39,7 @@ app.config["JSON_AS_ASCII"] = False
 
 DATA = {"screens": {}, "tables": {}, "groups": {}, "t2g": {},
         "problems": [], "ui_dir": "", "tbl_dir": "",
-        "files": [], "saved": "", "saved_mb": 0.0}
+        "files": [], "saved": "", "saved_mb": 0.0, "latest": ""}
 
 JOB = {"running": False, "done": False, "error": "",
        "stage": "대기", "files": [], "logs": []}
@@ -142,6 +142,13 @@ def save_result(pretty=None):
     mb = path.stat().st_size / 1024 / 1024
     DATA["saved"], DATA["saved_mb"] = str(path), round(mb, 2)
     note(f"저장: {path.name} ({mb:.2f} MB)")
+
+    try:
+        DATA["latest"] = doc_parser.update_latest(folder, path)
+        note(f"최신본 갱신: {doc_parser.LATEST_NAME}")
+    except OSError as e:
+        DATA["latest"] = ""
+        note(f"최신본을 갱신하지 못했습니다: {e}")
 
     keep = common.cfg.get_int("general", "keep_out_files", 0)
     for gone in doc_parser.prune(folder, keep):
@@ -273,6 +280,7 @@ def api_status():
         j["logs"] = JOB["logs"][-200:]
     j["saved"] = DATA["saved"]
     j["saved_mb"] = DATA["saved_mb"]
+    j["latest"] = DATA["latest"]
     j["counts"] = {
         "screens": len(DATA["screens"]), "tables": len(DATA["tables"]),
         "groups": len(DATA["groups"]),
@@ -361,7 +369,8 @@ def api_save():
         path = save_result(bool(d.get("pretty", False)))
     except Exception as e:
         return jsonify({"error": str(e)}), 400
-    return jsonify({"path": path, "mb": DATA["saved_mb"]})
+    return jsonify({"path": path, "mb": DATA["saved_mb"],
+                    "latest": DATA["latest"]})
 
 
 @app.route("/api/cache/clear", methods=["POST"])
@@ -582,7 +591,8 @@ async function poll(){
     $("#stage").textContent=j.stage;
     if(j.saved){
       $("#saved").style.display="flex";
-      $("#saved_path").textContent=j.saved+"  ("+j.saved_mb+" MB)";
+      $("#saved_path").textContent=j.saved+"  ("+j.saved_mb+" MB)"
+        +(j.latest?"   ← 최신본: "+j.latest.split(/[\\/]/).pop():"");
     }
     $("#files").innerHTML=j.files.map(f=>`<tr><td>${esc(f.kind)}</td>
       <td>${esc(f.name)}</td><td>${f.count}</td>

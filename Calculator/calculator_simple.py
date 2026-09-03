@@ -46,5 +46,6 @@ FORMS = {
 
 
 if __name__ == "__main__":
+    # 2016 양식은 한 파일로 간이법·상세법을 겸하므로 여기서도 고를 수 있게 함께 띄운다.
     import calculator_ui
-    calculator_ui.main(only=list(FORMS))
+    calculator_ui.main(only=list(FORMS) + ["2016-기능점수"])

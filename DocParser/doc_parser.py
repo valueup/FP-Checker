@@ -27,6 +27,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import zipfile
@@ -487,6 +488,10 @@ NAME_PREFIX = "doc_parser"
 NAME_TIME = "%Y%m%d_%H%M"
 NAME_GLOB = NAME_PREFIX + "_*.json"
 
+# 가장 최근 결과를 늘 같은 이름으로도 남긴다. 다른 모듈은 이 이름만 알면 된다.
+# 시각이 붙은 파일은 이력으로 남는다.
+LATEST_NAME = NAME_PREFIX + ".json"
+
 
 def make_name(when=None):
     """저장 파일 이름을 만든다. 예) doc_parser_20260903_1432.json"""
@@ -499,13 +504,31 @@ def find_all(folder):
     return sorted(glob.glob(os.path.join(os.fspath(folder), NAME_GLOB)))
 
 
+def update_latest(folder, src):
+    """방금 저장한 것을 doc_parser.json 으로도 복사한다.
+
+    쓰다 만 파일이 남지 않도록 임시 이름으로 복사한 뒤 바꿔치운다.
+    """
+    dst = os.path.join(os.fspath(folder), LATEST_NAME)
+    tmp = dst + ".tmp"
+    shutil.copyfile(os.fspath(src), tmp)
+    os.replace(tmp, dst)
+    return dst
+
+
 def latest(folder):
-    """가장 최근에 저장한 파일. 없으면 None.
+    """가장 최근 결과의 경로. 없으면 None.
+
+    doc_parser.json 이 있으면 그것을 쓴다. 없으면 시각이 붙은 파일 중 최신을
+    쓴다. 복사가 실패했거나 그 파일만 지운 경우를 대비한 것이다.
 
     다른 모듈은 이것으로 파일을 찾는다.
       path = doc_parser.latest(common.out_dir())
       data = doc_parser.load(path)
     """
+    fixed = os.path.join(os.fspath(folder), LATEST_NAME)
+    if os.path.exists(fixed):
+        return fixed
     files = find_all(folder)
     return files[-1] if files else None
 
@@ -638,13 +661,16 @@ def _main(argv):
     print(f"매핑 {len(pairs)}쌍 · 물리 표 수보다 FTR 후보가 작은 화면 {over}개")
 
     if out_path:
-        if os.path.isdir(out_path) or out_path.endswith((os.sep, "/")):
+        # .json 으로 끝나지 않으면 폴더로 본다. 아직 없는 폴더도 마찬가지다
+        if not out_path.lower().endswith(".json"):
             out_path = os.path.join(out_path, make_name())
         data = dump(screens, tables, groups, table_group, problems,
                     {"ui_dir": ui_dir, "tbl_dir": tbl_dir})
         save(out_path, data, pretty)
         size = os.path.getsize(out_path) / 1024 / 1024
         print(f"저장: {out_path} ({size:.1f} MB)")
+        fixed = update_latest(os.path.dirname(os.path.abspath(out_path)), out_path)
+        print(f"최신본: {fixed}")
     return 0
 
 
