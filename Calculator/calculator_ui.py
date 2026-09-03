@@ -51,10 +51,42 @@ DEV_TYPES = ["신규 개발", "수정 후 재사용", "수정 없이 재사용"]
 import calculator_detail as SPEC_DETAIL
 import calculator_simple as SPEC_SIMPLE
 
+try:
+    import calculator_planned as SPEC_PLANNED      # 추후 개발예정 목록(없어도 동작)
+except Exception:
+    SPEC_PLANNED = None
+
 FORMS = {}
-for _mod in (SPEC_DETAIL, SPEC_SIMPLE):
+for _mod in (SPEC_DETAIL, SPEC_SIMPLE, SPEC_PLANNED):
+    if _mod is None:
+        continue
     for _k, _v in _mod.FORMS.items():
         FORMS[_k] = _v
+
+
+def is_ready(key):
+    """실제로 다룰 수 있는 양식인가."""
+    return FORMS.get(key, {}).get("status") != "planned"
+
+
+GROUP_ORDER = ["기획단계", "구현단계", "운영단계", "데이터베이스", "기타"]
+
+
+def form_list(keys):
+    """화면 목록용. 단계 → 양식번호 순으로 정렬한다."""
+    def sort_key(k):
+        f = FORMS[k]
+        g = f.get("group", "기타")
+        gi = GROUP_ORDER.index(g) if g in GROUP_ORDER else len(GROUP_ORDER)
+        return (gi, f.get("code", ""), f.get("name", ""))
+    out = []
+    for k in sorted(keys, key=sort_key):
+        f = FORMS[k]
+        out.append({"key": k, "name": f.get("name", k),
+                    "code": f.get("code", ""), "group": f.get("group", "기타"),
+                    "file": f.get("file", ""), "ready": is_ready(k)})
+    return out
+
 
 # 화면에 보여줄 양식 목록(제한 가능). main(only=...) 으로 좁힌다.
 VISIBLE = list(FORMS)
@@ -385,6 +417,9 @@ def find_label_cell(ws, keys, upto, value_col=5):
 def read_workbook(path, form_key):
     if form_key not in FORMS:
         raise ValueError("알 수 없는 양식 구분입니다: %s" % form_key)
+    if not is_ready(form_key):
+        raise ValueError("아직 개발하지 않은 양식입니다: %s"
+                         % FORMS[form_key].get("name", form_key))
     form = FORMS[form_key]
     keep_vba = path.lower().endswith(".xlsm")
     wb = openpyxl.load_workbook(path, data_only=False, keep_vba=keep_vba)
@@ -668,7 +703,7 @@ def index():
 def api_init():
     cp = load_ini()
     recent = [p for p in cp["main"].get("recent", "").split("|") if p and os.path.exists(p)]
-    forms = [{"key": k, "name": FORMS[k]["name"]} for k in VISIBLE]
+    forms = form_list(VISIBLE)
     return jsonify({"app": APP_NAME, "version": VERSION, "recent": recent,
                     "forms": forms, "data": STATE.get("payload")})
 
@@ -689,7 +724,14 @@ def api_open():
         return jsonify({"ok": False, "msg": "파일 경로가 비어 있습니다."})
     if not os.path.exists(path):
         return jsonify({"ok": False, "msg": "파일을 찾을 수 없습니다: %s" % path})
-    form = body.get("form") or guess_form(path) or VISIBLE[0]
+    form = body.get("form") or guess_form(path)
+    if form and not is_ready(form):
+        return jsonify({"ok": False,
+                        "msg": "'%s' 은(는) 아직 개발하지 않은 양식입니다."
+                               % FORMS[form].get("name", form)})
+    if not form:
+        ready = [k for k in VISIBLE if is_ready(k)]
+        form = ready[0] if ready else ""
     try:
         data = read_workbook(path, form)
     except Exception as e:
@@ -847,6 +889,14 @@ tr.bad td.ro{background:#fdecea;color:#c0392b;font-weight:700}
 #open input[type=text]{width:100%;padding:6px;border:1px solid #bbb}
 #open label{display:block;padding:8px 10px;border:1px solid #ccc;border-radius:4px;margin:5px 0;cursor:pointer;background:#fff}
 #open label.on{background:#eaf3fb;border-color:#4a90d9}
+#open label.off{color:#999;background:#f7f7f7;border-color:#e0e0e0;cursor:default}
+#open .grp{margin:14px 0 4px;font-weight:700;color:#2c3e50;font-size:12px;
+  border-bottom:1px solid #ccd;padding-bottom:3px}
+#open .code{display:inline-block;min-width:52px;color:#12507b;font-weight:700}
+#open label.off .code{color:#aaa}
+#open .soon{font-size:11px;color:#b06000;background:#fff3e0;border:1px solid #ffcc80;
+  border-radius:3px;padding:1px 5px;margin-left:4px}
+#open .fn{font-size:11px;color:#999;margin:2px 0 0 52px}
 #open h3{font-size:13px;margin:18px 0 6px;padding-left:6px;border-left:4px solid #2c3e50}
 .rec{display:block;margin:3px 0;color:#12507b;text-decoration:none;font-size:12px}
 small{color:#666}
@@ -1322,33 +1372,29 @@ function tab(p){document.querySelectorAll('.tab').forEach(function(t){t.classLis
   document.querySelectorAll('.pane').forEach(function(t){t.classList.toggle('on',t.id===p);});}
 function openDlg(){document.getElementById('open').style.display='block';
   document.getElementById('main').style.display='none';}
+function firstReady(){for(var i=0;i<FORMS.length;i++){if(FORMS[i].ready)return FORMS[i].key;}return '';}
 function paintForms(sel){
-  FORM=sel||(FORMS.length?FORMS[0].key:'');
-  var h='';
+  var ok=false;
+  FORMS.forEach(function(f){if(f.key===sel&&f.ready)ok=true;});
+  FORM = ok ? sel : firstReady();
+  var h='', g='';
   FORMS.forEach(function(f){
-    h+='<label class="'+(f.key===FORM?'on':'')+'" onclick="paintForms(\''+f.key+'\')">'+
-       '<input type="radio" name="fm" style="width:auto" '+(f.key===FORM?'checked':'')+'> <b>'+f.key+'</b> · '+esc(f.name)+'</label>';});
+    if(f.group!==g){g=f.group; h+='<div class="grp">'+esc(g)+'</div>';}
+    var code=f.code?('<span class="code">'+esc(f.code)+'</span> '):'';
+    if(f.ready){
+      h+='<label class="'+(f.key===FORM?'on':'')+'" onclick="paintForms(\''+f.key+'\')">'+
+         '<input type="radio" name="fm" style="width:auto" '+(f.key===FORM?'checked':'')+'> '+
+         code+esc(f.name)+
+         (f.file?'<div class="fn">'+esc(f.file)+'</div>':'')+'</label>';
+    }else{
+      h+='<label class="off" title="아직 지원하지 않는 양식입니다">'+
+         '<input type="radio" disabled style="width:auto"> '+code+esc(f.name)+
+         ' <span class="soon">추후 개발예정</span>'+
+         (f.file?'<div class="fn">'+esc(f.file)+'</div>':'')+'</label>';
+    }
+  });
   document.getElementById('forms').innerHTML=h;
 }
-function listDir(d){
-  document.getElementById('browser').style.display='block';
-  fetch('/api/list',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({dir:d})}).then(function(r){return r.json();}).then(function(j){
-    if(!j.ok){document.getElementById('entries').innerHTML='<span class="warn">'+esc(j.msg)+'</span>';return;}
-    document.getElementById('dir').value=j.dir;
-    var h='';
-    if(j.parent) h+='<a class="rec" href="#" onclick="listDir('+JSON.stringify(j.parent)+');return false;">.. 상위 폴더</a>';
-    j.dirs.forEach(function(n){
-      var full=j.dir+j.sep+n;
-      h+='<a class="rec" href="#" onclick="listDir('+JSON.stringify(full)+');return false;">[폴더] '+esc(n)+'</a>';});
-    j.files.forEach(function(n){
-      var full=j.dir+j.sep+n;
-      h+='<a class="rec" href="#" onclick="pickPath('+JSON.stringify(full)+');return false;">'+esc(n)+'</a>';});
-    if(!j.dirs.length&&!j.files.length) h='<small>이 폴더에 엑셀 파일이 없습니다.</small>';
-    document.getElementById('entries').innerHTML=h;
-  });}
-function pickPath(p){document.getElementById('path').value=p;
-  document.getElementById('browser').style.display='none';guess();}
 function browse(){fetch('/api/browse',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({mode:'open'})}).then(function(r){return r.json();}).then(function(j){
     if(j.ok&&j.path){pickPath(j.path);}
@@ -1410,7 +1456,7 @@ window.onbeforeunload=function(){if(DIRTY)return '저장하지 않은 변경이 
 setInterval(function(){fetch('/api/alive',{method:'POST'});},4000);
 document.getElementById('path').addEventListener('change',guess);
 fetch('/api/init').then(function(r){return r.json();}).then(function(j){
-  FORMS=j.forms; paintForms(j.data?j.data.form:(j.forms.length?j.forms[0].key:''));
+  FORMS=j.forms; paintForms(j.data?j.data.form:'');
   if(j.data) load(j.data);
   var h='';
   if(j.recent&&j.recent.length){h='<h3>최근 파일</h3>';
@@ -1498,7 +1544,7 @@ def main(only=None):
     path = arg_path()
     if path:
         form = arg_form() or guess_form(path)
-        if form not in VISIBLE:
+        if form not in VISIBLE or not is_ready(form):
             print("양식을 판단하지 못했습니다. 화면에서 선택하십시오:", path)
         else:
             try:
